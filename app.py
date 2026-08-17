@@ -23,9 +23,9 @@ st.set_page_config(
 )
 
 # ==============================================================================
-# DICIONÁRIOS E MAPEAMENTOS
+# GERENCIAMENTO DE ESTADO DAS CONTAS (SESSION STATE)
 # ==============================================================================
-MAPA_RESULTADO = {
+MAPA_RESULTADO_PADRAO = {
     "112075-1": "1.1.1.02.001 BANCO DO BRASIL S/A AG 3174-7 CC 112075",
     "1155": "1.1.1.02.002 CAIXA ECONOMICA FEDERAL AG 1011 CC 1155",
     "010500020567": "1.1.1.02.003 UNILOS AG 0105-8 CC 2056-7",
@@ -57,14 +57,13 @@ MAPA_RESULTADO = {
     "0005772202819": "1.1.1.02.020 CAIXA ECONOMICA FEDERAL AG 4270 CC 661-5",
     "560586-5": "1.1.1.02.037 BANCO SICOOB AG 3069 CC 560.586-5",
     "0009898788": "1.1.1.02.029 BANCO SOFISA AG 0019 CC 989878-8",
-    "010500243574": "",
     "002342546-8": "1.1.1.02.038 BANCO ABC AG 00019 CC 002342546-8",
     "002342555-7": "1.1.1.02.039 BANCO ABC AG 00019 CC 002342555-7",
     "002342557-3": "1.1.1.02.040 BANCO ABC AG 00019 CC 002342557-3",
     "0009898770": "1.1.1.02.022 BANCO SOFISA AG 0019 CC 989877-0",
 }
 
-MAPA_SUBSIDIARIA = {
+MAPA_SUBSIDIARIA_PADRAO = {
     "112075-1": "S3ENG", "1155": "S3ENG", "010500020567": "S3ENG",
     "01375801802": "S3ENG", "24357-4": "EDUCATION", "30646-0": "INEXT",
     "30648-7": "QIHUB", "30552-9": "INEXT", "30551-0": "EDUCATION",
@@ -75,13 +74,18 @@ MAPA_SUBSIDIARIA = {
     "010617594430": "QIHUB", "2050290005049": "S3ENG", "2260000000640801": "S3ENG",
     "01372186694": "S3ENG", "159667-5": "QIHUB", "989878-8": "S3ENG",
     "316075": "MN", "0005772202819": "MN", "560586-5": "S3ENG",
-    "0009898788": "S3ENG", "010500243574": "",
-    "002342546-8": "S3ENG", "002342555-7": "S3ENG", "002342557-3": "S3ENG",
-    "0009898770": "S3ENG",
+    "0009898788": "S3ENG", "002342546-8": "S3ENG", "002342555-7": "S3ENG",
+    "002342557-3": "S3ENG", "0009898770": "S3ENG",
 }
 
-MAPA_ID_SUBSIDIARIA = {"S3ENG": 3, "MN": 4, "EDUCATION": 5, "QIHUB": 6}
+# Inicializa no Session State para manter as alterações durante o uso
+if "mapa_resultado" not in st.session_state:
+    st.session_state.mapa_resultado = MAPA_RESULTADO_PADRAO.copy()
 
+if "mapa_subsidiaria" not in st.session_state:
+    st.session_state.mapa_subsidiaria = MAPA_SUBSIDIARIA_PADRAO.copy()
+
+MAPA_ID_SUBSIDIARIA = {"S3ENG": 3, "MN": 4, "EDUCATION": 5, "QIHUB": 6}
 FILTRO_CNPJ = {"03984954000174", "04305879000130", "41551291000193", "37206151000100"}
 FILTRO_TEXTO = ["TRANSFERENCIA ENTRE CONTAS", "LIBERACAO DE CONTA VINCULADA", "RETIRADA POUP.",
                 "TRANSF.ENTRE CC - AUTOMATICO", "TRANSFERENCIA ENTRE C/C"]
@@ -127,23 +131,19 @@ def eh_transferencia(desc):
 
 def processar_ofx_files(uploaded_files):
     consolidado = []
-    contas_falt, subs_falt = set(), set()
+    contas_falt = set()
     linhas_ignoradas = 0
 
     for file in uploaded_files:
         if not file.name.lower().endswith('.ofx'):
             continue
         try:
-            # Garante a leitura a partir do início do buffer
             file.seek(0)
             ofx = OfxParser.parse(file)
             rows = []
 
             for acc in ofx.accounts:
-                st.info(f"📁 Arquivo **{file.name}** | Conta ID detectada: `{acc.account_id}`")
-
                 if not hasattr(acc, "statement"):
-                    st.warning(f"A conta `{acc.account_id}` no arquivo {file.name} não possui extrato.")
                     continue
 
                 for tx in acc.statement.transactions:
@@ -156,53 +156,51 @@ def processar_ofx_files(uploaded_files):
                     })
 
             if not rows:
-                st.warning(f"Nenhuma transação encontrada no arquivo `{file.name}`.")
                 continue
 
             df = pd.DataFrame(rows)
             df["Data"] = pd.to_datetime(df["Data"]).dt.strftime("%Y-%m-%d")
             df["Data_fmt"] = pd.to_datetime(df["Data"]).dt.strftime("%d/%m/%Y")
 
-            # Filtro de transferências
             mask = df["Descricao"].apply(eh_transferencia)
             linhas_ignoradas += mask.sum()
             df = df[~mask].copy()
 
             if df.empty:
-                st.warning(
-                    f"Todas as transações de `{file.name}` foram removidas pelo filtro de transferências entre contas.")
                 continue
 
-            # Filtro de entradas (somente valores positivos)
             df["Entrada"] = df["Valor"].apply(lambda x: x if x > 0 else None)
             df_in = df[df["Entrada"].notnull()].copy()
 
             if df_in.empty:
-                st.warning(f"O arquivo `{file.name}` não contém débitos positivos/entradas de saldo.")
                 continue
 
-            df_in["Resultado"] = df_in["Conta ID"].map(MAPA_RESULTADO)
-            df_in["Sub"] = df_in["Conta ID"].map(MAPA_SUBSIDIARIA)
+            # Mapeamento dinâmico via session_state
+            df_in["Resultado"] = df_in["Conta ID"].map(st.session_state.mapa_resultado)
+            df_in["Sub"] = df_in["Conta ID"].map(st.session_state.mapa_subsidiaria)
 
-            if df_in["Resultado"].isnull().any():
-                faltantes = df_in[df_in["Resultado"].isnull()]["Conta ID"].unique()
-                contas_falt.update(faltantes)
-                st.error(f"Conta ID não cadastrada em MAPA_RESULTADO: {faltantes}")
+            # Identifica contas sem mapeamento
+            sem_mapa = df_in[df_in["Resultado"].isnull() | (df_in["Resultado"] == "")]
+            if not sem_mapa.empty:
+                contas_falt.update(sem_mapa["Conta ID"].unique())
 
-            if df_in["Sub"].isnull().any():
-                subs_falt.update(df_in[df_in["Sub"].isnull()]["Conta ID"].unique())
+            # Prossegue com o que está mapeado
+            df_validos = df_in[df_in["Resultado"].notnull() & (df_in["Resultado"] != "")].copy()
+
+            if df_validos.empty:
+                continue
 
             df_d = pd.DataFrame({
-                "ID EXTERNO": "Lancamento_" + df_in["Data"] + "_" + df_in["Sub"].astype(str),
-                "DATA": df_in["Data_fmt"],
+                "ID EXTERNO": "Lancamento_" + df_validos["Data"] + "_" + df_validos["Sub"].astype(str),
+                "DATA": df_validos["Data_fmt"],
                 "MOEDA": "Real",
                 "TAXA DE CAMBIO": 1,
-                "CONTA": df_in["Resultado"],
-                "DEBITO": df_in["Entrada"],
+                "CONTA": df_validos["Resultado"],
+                "DEBITO": df_validos["Entrada"],
                 "CREDITO": "",
-                "Descricao da linha": df_in["Descricao"],
-                "Memorando": "Recebimentos_" + df_in["Data"],
-                "Subsidiaria": df_in["Sub"],
+                "Descricao da linha": df_validos["Descricao"],
+                "Memorando": "Recebimentos_" + df_validos["Data"],
+                "Subsidiaria": df_validos["Sub"],
             })
 
             df_c = df_d.copy()
@@ -219,7 +217,7 @@ def processar_ofx_files(uploaded_files):
         except Exception as e:
             st.error(f"Erro ao processar o arquivo {file.name}: {e}")
 
-    return consolidado, contas_falt, subs_falt, linhas_ignoradas
+    return consolidado, contas_falt, linhas_ignoradas
 
 
 def processar_pdf_sofisa(uploaded_files):
@@ -242,11 +240,10 @@ def processar_pdf_sofisa(uploaded_files):
                 continue
 
             conta_id = m_conta.group(1)
-            conta_banco = MAPA_RESULTADO.get(conta_id, "")
-            sub_nome = MAPA_SUBSIDIARIA.get(conta_id, "")
+            conta_banco = st.session_state.mapa_resultado.get(conta_id, "")
+            sub_nome = st.session_state.mapa_subsidiaria.get(conta_id, "")
 
             if not conta_banco or not sub_nome:
-                st.error(f"Conta PDF Sofisa `{conta_id}` não mapeada.")
                 continue
 
             sub_id = MAPA_ID_SUBSIDIARIA.get(sub_nome, sub_nome)
@@ -281,7 +278,38 @@ def processar_pdf_sofisa(uploaded_files):
 
 
 # ==============================================================================
-# INTERFACE STREAMLIT
+# SIDEBAR: CADASTRO MANUAL DE CONTAS
+# ==============================================================================
+with st.sidebar:
+    st.header("⚙️ Gerenciar Contas Bancárias")
+    st.caption("Cadastre manualmente novas contas ou consulte os mapeamentos existentes.")
+
+    with st.expander("➕ Cadastrar Nova Conta"):
+        nova_conta_id = st.text_input("ID da Conta (conforme OFX/PDF):", placeholder="Ex: 000123456")
+        novo_resultado = st.text_input("Conta Contábil completa:",
+                                       placeholder="Ex: 1.1.1.02.041 BANCO TESTE AG 0001 CC 123456")
+        nova_sub = st.selectbox("Subsidiária:", options=["S3ENG", "MN", "EDUCATION", "QIHUB"])
+
+        if st.button("Salvar Mapeamento", use_container_width=True):
+            if nova_conta_id and novo_resultado:
+                st.session_state.mapa_resultado[nova_conta_id.strip()] = novo_resultado.strip()
+                st.session_state.mapa_subsidiaria[nova_conta_id.strip()] = nova_sub
+                st.success(f"Conta `{nova_conta_id}` cadastrada com sucesso!")
+                st.rerun()
+            else:
+                st.error("Preencha o ID da Conta e a Conta Contábil.")
+
+    with st.expander("📋 Ver Contas Mapeadas"):
+        df_mapa = pd.DataFrame({
+            "Conta ID": list(st.session_state.mapa_resultado.keys()),
+            "Conta Contábil": list(st.session_state.mapa_resultado.values()),
+            "Subsidiária": [st.session_state.mapa_subsidiaria.get(k, "") for k in
+                            st.session_state.mapa_resultado.keys()]
+        })
+        st.dataframe(df_mapa, use_container_width=True, hide_index=True)
+
+# ==============================================================================
+# INTERFACE PRINCIPAL STREAMLIT
 # ==============================================================================
 st.title("⚡ Consolidação Diária de Extratos (OFX/PDF)")
 st.caption("Importe seus extratos bancários para gerar os lançamentos contábeis prontos para importação no ERP.")
@@ -294,8 +322,33 @@ uploaded_files = st.file_uploader(
 
 if uploaded_files:
     with st.spinner("Processando arquivos..."):
-        bloco_ofx, contas_falt, subs_falt, transf_ignoradas = processar_ofx_files(uploaded_files)
+        bloco_ofx, contas_falt, transf_ignoradas = processar_ofx_files(uploaded_files)
         df_sofisa = processar_pdf_sofisa(uploaded_files)
+
+        # SE HOUVER CONTAS NÃO MAPEADAS, EXIBE O FORMULÁRIO DE CADASTRO RÁPIDO
+        if contas_falt:
+            st.error(
+                f"🚨 **Atenção:** Foram encontradas **{len(contas_falt)}** conta(s) não cadastrada(s) nos arquivos importados:")
+
+            for c_id in contas_falt:
+                with st.form(key=f"form_cad_{c_id}"):
+                    st.warning(f"Conta não reconhecida: **`{c_id}`**")
+                    col_c1, col_c2, col_c3 = st.columns([3, 2, 1])
+
+                    c_contabil = col_c1.text_input("Conta Contábil Completa", key=f"c_{c_id}",
+                                                   placeholder="Ex: 1.1.1.02.050 BANCO X AG 1234 CC 56789")
+                    c_sub = col_c2.selectbox("Subsidiária", options=["S3ENG", "MN", "EDUCATION", "QIHUB"],
+                                             key=f"s_{c_id}")
+                    submit = col_c3.form_submit_button("Salvar Conta")
+
+                    if submit:
+                        if c_contabil:
+                            st.session_state.mapa_resultado[c_id] = c_contabil.strip()
+                            st.session_state.mapa_subsidiaria[c_id] = c_sub
+                            st.success(f"Conta `{c_id}` salva com sucesso!")
+                            st.rerun()
+                        else:
+                            st.error("Informe a descrição contábil para salvar.")
 
         partes = []
         if bloco_ofx:
@@ -322,10 +375,6 @@ if uploaded_files:
             if not balanceado:
                 st.error("🚨 Atenção: A soma dos Débitos difere da soma dos Créditos!")
 
-            if contas_falt or subs_falt:
-                st.warning(
-                    f"⚠️ **Contas/Subsidiárias pendentes de cadastro:**\n- **Contas:** {list(contas_falt)}\n- **Subsidiárias:** {list(subs_falt)}")
-
             if transf_ignoradas > 0:
                 st.info(
                     f"ℹ️ Foram filtradas **{transf_ignoradas}** movimentações referentes a transferências internas.")
@@ -336,7 +385,6 @@ if uploaded_files:
             st.subheader("📥 Exportar Dados Tratados")
             col_csv, col_excel = st.columns(2)
 
-            # Exportação em CSV
             csv_bytes = df_final.to_csv(index=False, sep=",", encoding="utf-8-sig").encode("utf-8-sig")
             data_hoje = datetime.now().strftime("%Y-%m-%d")
             col_csv.download_button(
@@ -347,7 +395,6 @@ if uploaded_files:
                 use_container_width=True
             )
 
-            # Exportação em Excel
             buffer_excel = io.BytesIO()
             with pd.ExcelWriter(buffer_excel, engine="openpyxl") as writer:
                 df_final.to_excel(writer, index=False)
@@ -360,6 +407,5 @@ if uploaded_files:
                 use_container_width=True
             )
 
-        else:
-            st.error(
-                "Nenhum lançamento válido foi gerado a partir dos arquivos selecionados. Verifique as mensagens acima para detalhes.")
+        elif not contas_falt:
+            st.error("Nenhum lançamento válido foi gerado a partir dos arquivos selecionados.")
